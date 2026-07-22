@@ -52,7 +52,7 @@ def pgcs_1(
             metric = logits - torch.gather(logits, 1, idxs[:, None, :])
             
         gmi = torch.logsumexp(
-            metric + torch.log(symbol_probabilities[idxs][:, None, :]), 
+            metric + torch.log(symbol_probabilities[None, :, None]), 
             dim=1, 
         ) / np.log(2)
         gmi_loss = torch.mean(gmi)
