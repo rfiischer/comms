@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import OrderedDict
-import re
+import math
 
 import torch_utils as tu
 
@@ -117,49 +117,144 @@ class ConvEQ(SequentialConv):
         return super().forward(F.pad(x, self.padding, mode='circular'))
 
 
-class ConvDecisionRegion(nn.Module):
-    def __init__(self, n_intervals, kernel_size, sps, hidden_dim=8, device='cpu'):
+class SequentialTensorTrain(nn.Module):
+    def __init__(self, option_sizes: list[int], rank: int):
         super().__init__()
-        # n_intervals is now the TOTAL number of regions (N_I), e.g., 32 or 64.
-        self.N_I = n_intervals 
-        self.kernel_size = kernel_size
-        self.sps = sps
+        self.num_cores = len(option_sizes)
+        self.cores = nn.ParameterList()
         
-        # 1. Feature Extractor (Sliding Window)
-        # stride=sps natively downsamples the oversampled signal to the symbol rate
-        self.conv1 = nn.Conv1d(
-            in_channels=1, 
-            out_channels=hidden_dim, 
-            kernel_size=kernel_size, 
-            stride=sps
-        ).to(device)
-        
-        # 2. Region Projector (1x1 Convolution)
-        # Acts as a pointwise linear combination to map features to regions
-        self.conv2 = nn.Conv1d(
-            in_channels=hidden_dim, 
-            out_channels=self.N_I, 
-            kernel_size=1
-        ).to(device)
-
-    def forward(self, rx):
-        """
-        rx: Expected shape (B, 1, N_samp) or (B, N_samp)
-        """
-        if rx.dim() == 2:
-            rx = rx.unsqueeze(1)
+        r_prev = 1
+        for k, num_options in enumerate(option_sizes):
+            r_next = 1 if (k == self.num_cores - 1) else rank
             
-        # Pad exactly like the previous logic to maintain time alignment
-        padded_rx = F.pad(rx, (self.kernel_size // 2, self.kernel_size // 2))
+            core = nn.Parameter(torch.empty(num_options, r_prev, r_next))
+            
+            nn.init.normal_(core, mean=0.0, std=1.0 / math.sqrt(r_prev * r_next))
+            self.cores.append(core)
+            r_prev = r_next
+
+    def expand(self, transition_matrix: torch.Tensor = None, start: int = 0) -> torch.Tensor:
+        state = transition_matrix
+        for core in self.cores[start:]:
+            if state is None:
+                # First core: (Q, r_prev, r_next). Drop r_prev=1 safely.
+                state = core[:, 0, :] 
+            else:
+                state = torch.einsum('...r, qrn -> ...qn', state, core)
+                
+        # Drop the final r_next dimension (which is always 1) safely without squeeze
+        return state[..., 0]
+
+    def forward(self, inputs: list[torch.Tensor], transition_matrix: torch.Tensor = None, start: int = 0) -> torch.Tensor:
+        state = transition_matrix
+        for i in range(len(inputs)):
+            core_slice = self.cores[i + start][inputs[i]]  # (B_eff, r_i, r_{i+1})
+            if state is None:
+                state = core_slice
+            else:
+                state = torch.bmm(state, core_slice)
+        return state
+
+
+class TTEQ(nn.Module):
+    def __init__(
+        self,
+        model,
+        channels,
+        kernel_sizes,
+        strides,
+        activation,
+        N_partitions: list[int],
+        Q_partitions: list[int],
+        N_b: list[int],
+        tt_rank: int,
+        activation_kwargs=None,
+    ):
+        super().__init__()
+        self.N_partitions = N_partitions
+        self.Q_partitions = Q_partitions
+        self.N_b = N_b
+        self.m = len(N_partitions)
+
+        out_channels = sum([N_partitions[i] * (Q_partitions[i] - 1) for i in range(len(N_partitions))])
+        kernel_sizes.append(1)
+        strides.append(1)
+        channels.append(out_channels)
+        self.decision_regions = ConvEQ(model, channels, kernel_sizes, strides, activation, activation_kwargs)
+
+        self.tt_engines = nn.ModuleList()
+        for i in range(self.m):
+            option_sizes = [Q_partitions[i]] * N_partitions[i]
+            
+            for j in range(i):
+                window_len = N_b[j] + 1  # L_{b,j} = N_{b,j} + 1
+                option_sizes.extend([2] * window_len)
+                
+            self.tt_engines.append(SequentialTensorTrain(option_sizes, rank=tt_rank))
+
+    def _extract_bit_windows(self, B_j: torch.Tensor, N_b_j: int) -> torch.Tensor:
+        L_b = N_b_j + 1
+        pad_left = N_b_j // 2
+        pad_right = N_b_j - pad_left
         
-        # Extract features: (B, 1, padded_L) -> (B, hidden_dim, block_size)
-        x = F.relu(self.conv1(padded_rx))
+        padded_B = F.pad(B_j, (pad_left, pad_right), mode='circular')
         
-        # Map to regions: (B, hidden_dim, block_size) -> (B, N_I, block_size)
-        logits = self.conv2(x)
+        return padded_B.unfold(-1, L_b, 1)
+
+    def forward(
+        self,
+        Y: torch.Tensor,
+        true_B: torch.Tensor | None = None,
+        use_true_B: bool = True,
+        tau=1.0,
+    ) -> torch.Tensor:
+        B = Y.shape[0]
+        regions_logits = self.decision_regions(Y)
+        N_sym = regions_logits.shape[-1]
+        one_hot_list = []
+        C_i_list = []
+        for i in range(self.m):
+            N_i, Q_i = self.N_partitions[i], self.Q_partitions[i]
+            logits_i = regions_logits[:, :N_i * (Q_i - 1), :]
+            regions_logits = regions_logits[:, N_i * (Q_i - 1):, :]
+            
+            logits_i = logits_i.view(Y.shape[0], N_i, Q_i - 1, N_sym)
+            logits_i = F.softmax(torch.cat([logits_i, torch.zeros(Y.shape[0], N_i, 1, N_sym, device=Y.device)], dim=2) / tau, dim=2)
+
+            one_hot_list.append(list(torch.unbind(logits_i, dim=1)))
+            C_i_list.append(list(torch.unbind(torch.argmax(logits_i, dim=2), dim=1)))
         
-        # Softmax creates valid probabilistic partitions across the N_I regions
-        probs = F.softmax(logits, dim=1)
-        
-        # Permute to match the estimator's expected shape: (N_I, B, block_size)
-        return probs.permute(1, 0, 2)
+        decoded_bits_list = []
+        llr_list = []
+        expanded_llr_list = []
+        bit_windows = []
+
+        for i in range(self.m):
+            if i > 0:
+                if use_true_B and true_B is not None:
+                    src_B = true_B[:, i - 1, :]
+                else:
+                    src_B = decoded_bits_list[-1]
+
+                b_win = self._extract_bit_windows(src_B, self.N_b[i - 1])
+                bit_windows.append(torch.unbind(b_win, dim=2))
+
+            tt_inputs = [t.flatten().long() for b in bit_windows for t in b]
+            bit_priors = self.tt_engines[i](tt_inputs)
+            expanded_llr_i = self.tt_engines[i].expand(bit_priors, start=len(tt_inputs))
+            llr_i = self.tt_engines[i]([t.flatten() for t in C_i_list[i]], bit_priors, start=len(tt_inputs)).squeeze()
+
+            # Reshape back to temporal symbol format (B, N_symbols)
+            llr_i = llr_i.view(B, N_sym)
+            llr_list.append(llr_i)
+            if i == 0:
+                expanded_llr_list.append(expanded_llr_i)
+            else:
+                expanded_llr_list.append(expanded_llr_i.reshape(B, N_sym, *expanded_llr_i.shape[1:]))
+
+            # Hard decision thresholding
+            decided_bit = (llr_i < 0)
+            decoded_bits_list.append(decided_bit)
+
+        # Stack LLRs across all bit levels: (B, m, N_symbols)
+        return torch.stack(llr_list, dim=1), expanded_llr_list, one_hot_list
