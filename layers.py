@@ -67,7 +67,7 @@ class ConvGRU(tu.ConvGRU):
 
         mult_cost += 3 * self.num_layers * self.hidden_size
 
-        return mult_cost.item()
+        return mult_cost.item() if mult_cost != 0 else 0
 
 
 class Conv1d(nn.Conv1d):
@@ -133,27 +133,36 @@ class SequentialTensorTrain(nn.Module):
             self.cores.append(core)
             r_prev = r_next
 
-    def expand(self, transition_matrix: torch.Tensor = None, start: int = 0) -> torch.Tensor:
-        state = transition_matrix
+    def expand(self, state: torch.Tensor = None, start: int = 0) -> torch.Tensor:
         for core in self.cores[start:]:
             if state is None:
-                # First core: (Q, r_prev, r_next). Drop r_prev=1 safely.
-                state = core[:, 0, :] 
+                # core is (q, r=1, n). We extract state as (n, q, 1, 1) with dummy batch dimensions.
+                state = core[:, 0, :].transpose(0, 1)[..., None, None] 
             else:
-                state = torch.einsum('...r, qrn -> ...qn', state, core)
-                
-        # Drop the final r_next dimension (which is always 1) safely without squeeze
-        return state[..., 0]
+                # Appends 'q' to the grid while protecting 'b, s' at the end
+                state = torch.einsum('r...bs, qrn -> nq...bs', state, core)
+                    
+        return state[0] # Drop the final n=1 rank dimension
 
-    def forward(self, inputs: list[torch.Tensor], transition_matrix: torch.Tensor = None, start: int = 0) -> torch.Tensor:
-        state = transition_matrix
+    def forward(self, inputs: list[torch.Tensor], state: torch.Tensor = None, start: int = 0) -> torch.Tensor:
         for i in range(len(inputs)):
-            core_slice = self.cores[i + start][inputs[i]]  # (B_eff, r_i, r_{i+1})
+            # inputs[i] is (B, N_sym) naturally!
+            # core_slice becomes (B, N_sym, r_prev, r_next)
+            core_slice = self.cores[i + start][inputs[i]]
             if state is None:
-                state = core_slice
+                # Extract r_next to the front -> (r_next, B, N_sym)
+                state = core_slice[:, :, 0, :].permute(2, 0, 1)
             else:
-                state = torch.bmm(state, core_slice)
+                # Contract r_prev securely -> (r_next, B, N_sym)
+                state = torch.einsum('rbs, bsrn -> nbs', state, core_slice)
         return state
+
+    def get_cost(self):
+        cost = 0
+        for core in self.cores[1:]:
+            cost_options = torch.sum(core != 0, dim=(1, 2)) # Sum out the r_prev and r_next dimensions
+            cost += torch.max(cost_options) # Take the maximum cost across all options in the core
+        return cost.item() if cost != 0 else 0
 
 
 class TTEQ(nn.Module):
@@ -176,7 +185,7 @@ class TTEQ(nn.Module):
         self.N_b = N_b
         self.m = len(N_partitions)
 
-        out_channels = sum([N_partitions[i] * (Q_partitions[i] - 1) for i in range(len(N_partitions))])
+        out_channels = sum([N_partitions[i] * (Q_partitions[i] - 1) for i in range(self.m)])
         kernel_sizes.append(1)
         strides.append(1)
         channels.append(out_channels)
@@ -184,12 +193,15 @@ class TTEQ(nn.Module):
 
         self.tt_engines = nn.ModuleList()
         for i in range(self.m):
-            option_sizes = [Q_partitions[i]] * N_partitions[i]
+            option_sizes = []
             
+            # 1. Historical bit cores FIRST (since tt_inputs feeds bits first)
             for j in range(i):
-                window_len = N_b[j] + 1  # L_{b,j} = N_{b,j} + 1
+                window_len = N_b[j] + 1
                 option_sizes.extend([2] * window_len)
                 
+            # 2. Q partitions SECOND (so expand() creates the Q grid)
+            option_sizes.extend([self.Q_partitions[i]] * self.N_partitions[i])
             self.tt_engines.append(SequentialTensorTrain(option_sizes, rank=tt_rank))
 
     def _extract_bit_windows(self, B_j: torch.Tensor, N_b_j: int) -> torch.Tensor:
@@ -202,15 +214,14 @@ class TTEQ(nn.Module):
         return padded_B.unfold(-1, L_b, 1)
 
     def forward(
-        self,
-        Y: torch.Tensor,
-        true_B: torch.Tensor | None = None,
-        use_true_B: bool = True,
-        tau=1.0,
+        self, Y: torch.Tensor, true_B: torch.Tensor | None = None, 
+        use_true_B: bool = False, tau=1.0
     ) -> torch.Tensor:
+            
         B = Y.shape[0]
         regions_logits = self.decision_regions(Y)
         N_sym = regions_logits.shape[-1]
+
         one_hot_list = []
         C_i_list = []
         for i in range(self.m):
@@ -218,43 +229,44 @@ class TTEQ(nn.Module):
             logits_i = regions_logits[:, :N_i * (Q_i - 1), :]
             regions_logits = regions_logits[:, N_i * (Q_i - 1):, :]
             
-            logits_i = logits_i.view(Y.shape[0], N_i, Q_i - 1, N_sym)
-            logits_i = F.softmax(torch.cat([logits_i, torch.zeros(Y.shape[0], N_i, 1, N_sym, device=Y.device)], dim=2) / tau, dim=2)
+            logits_i = logits_i.view(B, N_i, Q_i - 1, N_sym)
+            logits_i = F.softmax(torch.cat([logits_i, torch.zeros(B, N_i, 1, N_sym, device=Y.device)], dim=2) / tau, dim=2)
 
             one_hot_list.append(list(torch.unbind(logits_i, dim=1)))
             C_i_list.append(list(torch.unbind(torch.argmax(logits_i, dim=2), dim=1)))
         
-        decoded_bits_list = []
-        llr_list = []
         expanded_llr_list = []
+        llr_list = []
+        decoded_bits_list = []
         bit_windows = []
 
         for i in range(self.m):
             if i > 0:
-                if use_true_B and true_B is not None:
-                    src_B = true_B[:, i - 1, :]
-                else:
-                    src_B = decoded_bits_list[-1]
+                if self.N_b[i - 1] > -1:
+                    src_B = true_B[:, i - 1, :] if (use_true_B and true_B is not None) else decoded_bits_list[-1]
+                    b_win = self._extract_bit_windows(src_B, self.N_b[i - 1])
+                    bit_windows.append(torch.unbind(b_win, dim=2))
 
-                b_win = self._extract_bit_windows(src_B, self.N_b[i - 1])
-                bit_windows.append(torch.unbind(b_win, dim=2))
-
-            tt_inputs = [t.flatten().long() for b in bit_windows for t in b]
+            # Look how clean this is now! We just pass the (B, N_sym) tensors directly
+            tt_inputs = [t.long() for b in bit_windows for t in b]
             bit_priors = self.tt_engines[i](tt_inputs)
+
+            # expanded_llr_i naturally comes out as (Q_i_0, ..., Q_i_k, B, N_sym)
             expanded_llr_i = self.tt_engines[i].expand(bit_priors, start=len(tt_inputs))
-            llr_i = self.tt_engines[i]([t.flatten() for t in C_i_list[i]], bit_priors, start=len(tt_inputs)).squeeze()
+            view_shape = expanded_llr_i.shape[:-2] + (1,) * sum(self.N_partitions[:i]) + expanded_llr_i.shape[-2:]
+            expanded_llr_list.append(expanded_llr_i.view(view_shape))
 
-            # Reshape back to temporal symbol format (B, N_symbols)
-            llr_i = llr_i.view(B, N_sym)
+            # 2. HARD DECISIONS
+            llr_i = self.tt_engines[i](C_i_list[i], bit_priors, start=len(tt_inputs))
+            llr_i = llr_i[0] # Drop the r=1 rank dimension -> leaves (B, N_sym)
+            
             llr_list.append(llr_i)
-            if i == 0:
-                expanded_llr_list.append(expanded_llr_i)
-            else:
-                expanded_llr_list.append(expanded_llr_i.reshape(B, N_sym, *expanded_llr_i.shape[1:]))
+            decoded_bits_list.append((llr_i < 0))
 
-            # Hard decision thresholding
-            decided_bit = (llr_i < 0)
-            decoded_bits_list.append(decided_bit)
-
-        # Stack LLRs across all bit levels: (B, m, N_symbols)
         return torch.stack(llr_list, dim=1), expanded_llr_list, one_hot_list
+
+    def get_cost(self):
+        cost = self.decision_regions.get_cost()
+        for engine in self.tt_engines:
+            cost += engine.get_cost()
+        return cost

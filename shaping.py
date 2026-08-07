@@ -89,8 +89,8 @@ def pgcs_1(
         if e_idx % n_mean == 0:
             with torch.no_grad():
                 decision_metric = term2
-                current_ber = torch.mean(((logits < 0) != bit_map[idxs, :]).float())
-                current_ser = torch.mean((torch.argmax(decision_metric, dim=1) != idxs).float())
+                current_ber = torch.mean(((logits < 0) != bit_map[idxs, :].permute(0, 2, 1)).float())
+                current_ser = torch.mean((torch.argmin(decision_metric, dim=1) != idxs).float())
                 avg_ber = beta_mean * avg_ber + (1 - beta_mean) * current_ber
                 avg_ser = beta_mean * avg_ser + (1 - beta_mean) * current_ser
                 avg_gmi = beta_mean * avg_gmi + (1 - beta_mean) * gmi_loss
@@ -110,7 +110,7 @@ def pgcs_2(
         reinforce_memory_length,
         proximal_lambda,
         n_epochs,
-        bit_wise,
+        decoding_order=(0, 1, 2),
         use_teacher_forcing=True,
         tau_start=1.0, tau_min=0.1, tau_decay=0.01,
         n_mean=50, n_logging=500, beta_mean=0.9
@@ -129,6 +129,7 @@ def pgcs_2(
     avg_ber = torch.tensor(0.0)
     avg_ser = torch.tensor(0.0)
     avg_gmi = torch.tensor(0.0)
+    avg_gmi_bits = [torch.tensor(0.0) for _ in range(bit_map.shape[1])]
     for e_idx in range(n_epochs):
         decoder_opt.zero_grad()
         encoder_opt.zero_grad()
@@ -139,109 +140,57 @@ def pgcs_2(
             tau = max(tau_min, tau_start * np.exp(-tau_decay * (e_idx - encoder_grace)))
 
         symbols, idxs = encoder()
-
-        # 1. Map integer symbol indices to ground-truth binary bit sequences
-        # bit_map shape: (2^m, m) | idxs shape: (B, N_symbols) -> true_B: (B, m, N_symbols)
-        true_B = bit_map[idxs].permute(0, 2, 1).float()
-        # TODO: this internally
+        true_B = bit_map[idxs].permute(0, 2, 1)
+        true_B = true_B[:, decoding_order, :]
 
         # 2. Transmit through channel
         rx = channel(symbols)
 
-        # 3. Non-Linear Equalizer forward pass
-        # Returns LLRs of shape (B, m, N_symbols) and CNN partition logits
-        # In NonLinearEqualizer.forward(), return (torch.stack(llr_list, dim=1), cnn_logits_list)
-        LLRs, expanded_llr_list, one_hot_list = decoder(
-            rx, 
-            true_B=true_B, 
-            use_true_B=use_teacher_forcing,  # True for teacher forcing, False for scheduled autoregression[cite: 1]
-            tau=tau  # Softmax relaxation temperature[cite: 1]
-        )
-
-        one_hot_list = [t for l in one_hot_list for t in l]
-        prob_grid = one_hot_list[0]
-        for p in one_hot_list[1:]:
-            prob_grid = torch.einsum('b...l, bql -> b...ql', prob_grid, p)
-
-        # 4. GMI Grid Broadcasting and Loss Calculation
-        B, N_sym = LLRs.shape[0], LLRs.shape[-1]
-        # a. Determine the full grid dimensions from the decoder
-        grid_dims = []
-        for N_i, Q_i in zip(decoder.N_partitions, decoder.Q_partitions):
-            grid_dims.extend([Q_i] * N_i)
-        
-        K = len(grid_dims) # Total number of partitions
-        target_shape = [B] + grid_dims + [N_sym]
-        
-        # b. Reshape and broadcast each level's LLRs to match the full grid
-        expanded_grid_llrs = []
-        start_idx = 0
-        for i in range(decoder.m):
-            N_i = decoder.N_partitions[i]
-            curr_llr = expanded_llr_list[i]
-            
-            if i == 0:
-                # Level 0 shape: (Q_0, ..., Q_0) -> N_0 dims. Doesn't have B or N_sym.
-                view_shape = [1] + grid_dims[:N_i] + [1] * (K - N_i) + [1]
-            else:
-                # Level i > 0 shape: (B, Q_i, ..., Q_i, N_sym) -> 2 + N_i dims.
-                view_shape = [B] + [1] * start_idx + grid_dims[start_idx:start_idx+N_i] + [1] * (K - start_idx - N_i) + [N_sym]
-                
-            # View to insert dummy dimensions, then expand to the full target shape
-            expanded_grid_llrs.append(curr_llr.view(view_shape).expand(target_shape))
-            start_idx += N_i
-            
-        # Stack along the bit dimension 'm'
-        # grid_logits shape: (B, m, q_1, q_2, ..., q_K, N_sym)
-        grid_logits = torch.stack(expanded_grid_llrs, dim=1)
-
+        # 3. Decoder forward pass
+        logits, expanded_llr_list, one_hot_list = decoder(rx, true_B=true_B, use_true_B=use_teacher_forcing, tau=tau)
+        B, _, N_sym = logits.shape
         symbol_probabilities = encoder.symbol_probabilities
-        true_B_grid = true_B.view(B, decoder.m, *([1]*K), N_sym)
 
-        # c. Compute the metric over the entire grid
-        if bit_wise:
-            # term1: (B, q_1, ..., q_K, N_sym)
-            term1 = torch.sum(true_B_grid * grid_logits, dim=1)
-            
-            # term2: Use einsum to multiply bit_map (c, m) with grid_logits (B, m, ..., N_sym)
-            # Result: (B, 2^m, q_1, ..., q_K, N_sym)
-            term2 = torch.einsum('cm, bm...s -> bc...s', bit_map.float(), grid_logits)
-            
-            metric = term1.unsqueeze(1) - term2
-        else:
-            # Symbol logits over the grid: (B, 2^m, q_1, ..., q_K, N_sym)
-            symbol_logits = torch.einsum('cm, bm...s -> bc...s', bit_map.float(), grid_logits)
-            
-            idxs_grid = idxs.view(B, 1, *([1]*K), N_sym).expand(B, 1, *grid_dims, N_sym)
-            true_symbol_logits = torch.gather(symbol_logits, 1, idxs_grid)
-            metric = symbol_logits - true_symbol_logits
+        # Build prob_grid (Q_0, ..., Q_K, B, N_sym)
+        # We permute each one-hot partition from (B, Q, N) -> (Q, B, N)
+        one_hot_list_flat = [p.permute(1, 0, 2) for l in one_hot_list for p in l]
+        prob_grid = one_hot_list_flat[0]
+        for p in one_hot_list_flat[1:]:
+            prob_grid = torch.einsum('...bs, qbs -> q...bs', prob_grid, p)
 
-        # d. Calculate GMI and expectation
-        log_sym_probs = torch.log(symbol_probabilities + 1e-12).view(1, -1, *([1]*K), 1)
+        term1_list = [true_B_slice * expanded_llr for true_B_slice, expanded_llr in zip(torch.unbind(true_B, dim=1), expanded_llr_list)]
+
+        term1 = sum(term1_list)
+        term2 = sum(bit_map_slice * expanded_llr[..., None] for bit_map_slice, expanded_llr in zip(torch.unbind(bit_map, dim=1), expanded_llr_list)) # Sums out 'm'
+        metric = term1[..., None] - term2
+
+        # GMI expectation 
+        log_sym_probs = torch.log(symbol_probabilities + 1e-12)
+        gmi_grid = torch.logsumexp(metric + log_sym_probs, dim=-1) / np.log(2)
         
-        # GMI for every possible path in the grid: (B, q_1, ..., q_K, N_sym)
-        gmi_grid = -torch.logsumexp(metric + log_sym_probs, dim=1) / np.log(2)
-        
-        # Expected GMI per symbol (weighting by prob_grid and summing over all Q dimensions)
-        dim_to_sum = list(range(1, K + 1))
-        gmi_per_symbol = torch.sum(prob_grid * gmi_grid, dim=dim_to_sum) # Shape: (B, N_sym)
-        
+        # Multiply by prob_grid and sum out all 'Q' dimensions (dim 0 to K-1)
+        gmi_per_symbol = torch.sum((prob_grid * gmi_grid).flatten(0, -3), dim=0) # Leaves (B, N_sym)
         gmi_loss = gmi_per_symbol.mean()
 
         # 5. REINFORCE correction for encoder symbol probabilities
-        correction = torch.sum(
-            F.pad(
-                torch.log(symbol_probabilities[idxs] + 1e-12),
-                (reinforce_memory_length // 2, reinforce_memory_length // 2), mode='circular'
-            ).unfold(dimension=1, size=reinforce_memory_length, step=1),
-            dim=2
-        )
-        
-        # Detach baseline subtraction using the exact per-symbol GMI tensor
-        loss_reinforce = torch.mean((gmi_per_symbol.detach() - gmi_per_symbol.detach().mean()) * correction)
+        if reinforce_memory_length > 0:
+            correction = torch.sum(
+                F.pad(
+                    torch.log(symbol_probabilities[idxs] + 1e-12),
+                    (reinforce_memory_length // 2, reinforce_memory_length // 2), mode='circular'
+                ).unfold(dimension=1, size=reinforce_memory_length, step=1),
+                dim=2
+            )
+            
+            # Detach baseline subtraction using the exact per-symbol GMI tensor
+            loss_reinforce = torch.mean((gmi_per_symbol.detach() - gmi_per_symbol.detach().mean()) * correction)
+
+        else:
+            loss_reinforce = 0
 
         # 6. Backpropagation and optimization step
         total_loss = gmi_loss + loss_reinforce
+
         # ... [remaining backward pass code] ...
         total_loss.backward()
 
@@ -264,9 +213,23 @@ def pgcs_2(
         # Training metrics
         if e_idx % n_mean == 0:
             with torch.no_grad():
-                decision_metric = torch.matmul(bit_map, LLRs)
-                current_ber = torch.mean(((LLRs > 0) != bit_map[idxs, :].permute(0, 2, 1)).float())
-                current_ser = torch.mean((torch.argmax(decision_metric, dim=1) != idxs).float())
+                term2_bit = [torch.tensor([0.0, 1.0]) * expanded_llr[..., None] for expanded_llr in expanded_llr_list]
+                gmi_bits = []
+                for i, term1 in enumerate(term1_list):
+                    metric = term1[..., None] - term2_bit[i]
+                    zero_prob = torch.sum(symbol_probabilities[bit_map[:, i] == 0])
+                    bit_probabilities = torch.tensor([zero_prob, 1 - zero_prob], device=metric.device)
+                    log_bit_probs = torch.log(bit_probabilities + 1e-12)
+                    gmi_grid = torch.logsumexp(metric + log_bit_probs, dim=-1) / np.log(2)
+                    gmi_per_symbol = torch.sum((prob_grid * gmi_grid).flatten(0, -3), dim=0) # Leaves (B, N_sym)
+                    gmi_bits.append(gmi_per_symbol.mean())
+
+                for i, gmi_bit in enumerate(gmi_bits):
+                    avg_gmi_bits[i] = beta_mean * avg_gmi_bits[i] + (1 - beta_mean) * gmi_bit
+
+                decision_metric = torch.matmul(bit_map, logits)
+                current_ber = torch.mean(((logits < 0) != true_B).float())
+                current_ser = torch.mean((torch.argmin(decision_metric, dim=1) != idxs).float())
                 avg_ber = beta_mean * avg_ber + (1 - beta_mean) * current_ber
                 avg_ser = beta_mean * avg_ser + (1 - beta_mean) * current_ser
                 avg_gmi = beta_mean * avg_gmi + (1 - beta_mean) * gmi_loss
@@ -275,5 +238,7 @@ def pgcs_2(
                     logging.info(f"SER estimate: {avg_ser.item()}")
                     logging.info(f"BER estimate: {avg_ber.item()}")
                     logging.info(f"GMI estimate: {avg_gmi.item()}")
+                    for i, gmi_bit in enumerate(avg_gmi_bits):
+                        logging.info(f"GMI bit {i}: {gmi_bit.item()}")
 
     return avg_ber.item(), avg_ser.item(), avg_gmi.item()
