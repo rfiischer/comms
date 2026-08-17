@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 def abs2(x):
     """Efficiently compute absolute value squared."""
@@ -96,3 +97,74 @@ class CD_DD:
         rx_time = rx_time[..., ::self.n_os // self.sps].real
 
         return rx_time
+
+
+class PDPAWGNChannel:
+    def __init__(
+        self,
+        K: int,
+        L: int,
+        min_p: float,
+        max_p: float,
+        min_snr_db: float,
+        max_snr_db: float,
+        dtype=torch.float32,
+        device="cpu"
+    ):
+        super().__init__()
+        self.dtype = dtype
+        self.device = device
+        self.K = K
+        self.L = L
+        self.N = self.K + self.L
+        self.rho = self.K / self.N
+
+        self.min_p = float(min_p)
+        self.max_p = float(max_p)
+        self.min_snr_db = float(min_snr_db)
+        self.max_snr_db = float(max_snr_db)
+
+    def sample_p(
+        self,
+        B: int,
+    ):
+        return torch.rand((B, 1), dtype=self.dtype, device=self.device) * (self.max_p - self.min_p) + self.min_p
+
+    def sample_snr_db(
+        self,
+        B: int,
+    ) -> torch.Tensor:
+        return torch.rand((B, 1), dtype=self.dtype, device=self.device) * (self.max_snr_db - self.min_snr_db) + self.min_snr_db
+
+    def generate_h(
+        self,
+        B: int,
+        p,
+    ) -> torch.Tensor:
+        complex_noise = torch.randn(size=(B, self.L), dtype=self.dtype, device=self.device) + 1j * torch.randn(size=(B, self.L), dtype=self.dtype, device=self.device)
+        power_scaling = torch.sqrt((p ** torch.arange(self.L, dtype=self.dtype, device=self.device)) / 2)
+
+        return power_scaling * complex_noise
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        x = x[..., 0]   # Last dimension should be a single time sample
+        B = x.shape[0]
+
+        p = self.sample_p(B) 
+        snr_db = self.sample_snr_db(B)
+        h = self.generate_h(B, p)
+
+        y = torch.conv1d(F.pad(x[None, :, :], (h.shape[-1] - 1, h.shape[-1] - 1)), h[:, None, :], groups=B)[0, ...]
+
+        is_one = torch.isclose(p, torch.tensor(1.0, dtype=self.dtype, device=self.device))
+        p_safe = torch.where(is_one, torch.tensor(0.0, dtype=self.dtype, device=self.device), p)
+        avg_fading = (1.0 - p_safe ** self.L) / (1.0 - p_safe)
+        avg_fading = torch.where(is_one, torch.tensor(self.L, dtype=self.dtype, device=self.device), avg_fading)
+        ebn0_linear = 10.0 ** (snr_db / 10.0)
+        noise_variance = avg_fading / (self.rho * ebn0_linear) # N_0
+        noise_std = torch.sqrt(noise_variance / 2.0)    # sqrt(N_0 / 2)
+
+        return y + noise_std * (torch.randn_like(y) + 1j * torch.randn_like(y))

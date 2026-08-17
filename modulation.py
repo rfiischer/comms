@@ -100,3 +100,81 @@ class Sampler(nn.Module):
         if size is None:
             size = self.default_size
         return sample(size, self.get_alphabet(), self.symbol_probabilities)
+
+
+class BMOCZEncoder(nn.Module):
+    def __init__(self, K: int, L: int, batch_size: int, train_alphabet: bool = False, train_probabilities: bool = False, device: torch.device = 'cpu', dtype=torch.float32):
+        super().__init__()
+        self.K = K
+        self.L = L
+        self.N = self.K + self.L
+        self.batch_size = batch_size
+        self.device = device
+        self.dtype = dtype
+
+        self.bit_logits = nn.Parameter(torch.randn(self.K, device=device, dtype=dtype), requires_grad=train_probabilities)
+        
+        self.R = nn.Parameter(
+            torch.sqrt(1.0 + torch.sin(torch.tensor(torch.pi / self.K, device=device, dtype=dtype))),
+            requires_grad=train_alphabet,
+        )
+
+        self.register_buffer("rotations", torch.exp(2j * torch.pi * (torch.arange(0, self.K, device=device, dtype=dtype)) / self.K))
+
+    @property
+    def symbol_probabilities(self) -> torch.Tensor:
+        aux_logits = torch.zeros(self.K, 2, device=self.device, dtype=self.dtype)
+        aux_logits[:, 0] = self.bit_logits
+        symbol_logits = aux_logits[0, :]
+        for i in range(1, self.K):
+            symbol_logits = symbol_logits[..., None] + aux_logits[i, :]
+
+        return torch.softmax(symbol_logits.flatten(), dim=0)
+
+    def get_alphabet(self) -> torch.Tensor:
+        alpha_0 = 1 / self.R * self.rotations
+        alpha_1 = self.R * self.rotations
+        alphabet = torch.stack([alpha_0[[-1]], alpha_1[[-1]]], dim=0)
+        for i in range(self.K - 2, -1, -1):
+            n = alphabet.shape[0]
+            alphabet_0 = torch.cat([alpha_0[None, [i]].expand(n, -1), alphabet], dim=1)
+            alphabet_1 = torch.cat([alpha_1[None, [i]].expand(n, -1), alphabet], dim=1)
+            alphabet = torch.cat([alphabet_0, alphabet_1], dim=0)
+
+        alphabet = self.encode_selected_zeros(alphabet)
+
+        return torch.stack([alphabet.real, alphabet.imag], dim=2)
+
+    @staticmethod
+    def encode_selected_zeros(alpha: torch.Tensor) -> torch.Tensor:
+        B, K = alpha.shape
+        x = torch.stack(
+            [
+                -alpha[:, 0],
+                torch.ones(B, device=alpha.device, dtype=alpha.dtype),
+            ],
+            dim=1,
+        )
+
+        for q in range(1, K):
+            a = alpha[:, q : q + 1]
+            x = torch.cat(
+                [torch.zeros(B, 1, device=alpha.device, dtype=alpha.dtype), x],
+                dim=1,
+            ) - torch.cat(
+                [a * x, torch.zeros(B, 1, device=alpha.device, dtype=alpha.dtype)],
+                dim=1,
+            )
+
+        return x / torch.sqrt(torch.sum(torch.abs(x) ** 2, dim=1, keepdim=True))
+
+    def forward(
+        self,
+        size=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if size is None:
+            B = self.batch_size
+        else:
+            B = size
+
+        return sample((B, 1), self.get_alphabet() * np.sqrt(self.N), self.symbol_probabilities)

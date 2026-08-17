@@ -57,15 +57,19 @@ def pgcs_1(
         ) / np.log(2)
         gmi_loss = torch.mean(gmi)
         
-        correction = torch.sum(
-            F.pad(
-                torch.log(symbol_probabilities[idxs]),
-                (reinforce_memory_length // 2, reinforce_memory_length // 2), mode='circular'
-            ).unfold(dimension=1, size=reinforce_memory_length, step=1),
-            dim=2
-        )
-        
-        loss_reinforce = torch.mean((gmi - gmi.mean()).detach() * correction)
+        if reinforce_memory_length > 0 and symbol_probabilities.requires_grad:
+            correction = torch.sum(
+                F.pad(
+                    torch.log(symbol_probabilities[idxs]),
+                    (reinforce_memory_length // 2, reinforce_memory_length // 2), mode='circular'
+                ).unfold(dimension=1, size=reinforce_memory_length, step=1),
+                dim=2
+            )
+            
+            loss_reinforce = torch.mean((gmi - gmi.mean()).detach() * correction)
+
+        else:
+            loss_reinforce = 0
         
         total_loss = gmi_loss + loss_reinforce
         total_loss.backward()
@@ -173,7 +177,7 @@ def pgcs_2(
         gmi_loss = gmi_per_symbol.mean()
 
         # 5. REINFORCE correction for encoder symbol probabilities
-        if reinforce_memory_length > 0:
+        if reinforce_memory_length > 0 and symbol_probabilities.requires_grad:
             correction = torch.sum(
                 F.pad(
                     torch.log(symbol_probabilities[idxs] + 1e-12),
