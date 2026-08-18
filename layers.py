@@ -282,8 +282,8 @@ class DiZeTDecoder(nn.Module):
         self.N = self.K + self.L
         self.R = R.to(dtype=self.dtype, device=self.device)
 
-        self.R0 = self.R ** -torch.arange(self.N, dtype=self.dtype, device=self.device)
-        self.R1 = self.R ** torch.arange(self.N, dtype=self.dtype, device=self.device)
+        self.register_buffer('R0', self.R ** -torch.arange(self.N, dtype=self.dtype, device=self.device))
+        self.register_buffer('R1', self.R ** torch.arange(self.N, dtype=self.dtype, device=self.device))
         self.Q = math.ceil(self.N / K)
         self.fft_size = self.Q * K
 
@@ -326,7 +326,7 @@ class ModifiedDiZeTDecoder(nn.Module):
         y0 = F.pad(y * self.R0, (0, self.fft_size - y.shape[-1]), mode='constant', value=0)
         y1 = F.pad(y * self.R1, (0, self.fft_size - y.shape[-1]), mode='constant', value=0)
 
-        return self.A * torch.abs(torch.fft.ifft(y1)[:, ::self.Q, None]) + self.B * torch.abs(self.R ** (self.N - 1) * torch.fft.ifft(y0)[:, ::self.Q, None]) + self.C        
+        return self.A * (torch.abs(torch.fft.ifft(y1)[:, ::self.Q, None]) + self.B * torch.abs(self.R ** (self.N - 1) * torch.fft.ifft(y0)[:, ::self.Q, None]) + self.C)        
 
     def get_cost(self) -> int:
         exponent = math.ceil(math.log2(self.fft_size))

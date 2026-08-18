@@ -112,7 +112,7 @@ class BMOCZEncoder(nn.Module):
         self.device = device
         self.dtype = dtype
 
-        self.bit_logits = nn.Parameter(torch.randn(self.K, device=device, dtype=dtype), requires_grad=train_probabilities)
+        self.bit_logits = nn.Parameter(torch.zeros(self.K, device=device, dtype=dtype), requires_grad=train_probabilities)
         
         self.R = nn.Parameter(
             torch.sqrt(1.0 + torch.sin(torch.tensor(torch.pi / self.K, device=device, dtype=dtype))),

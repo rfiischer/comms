@@ -5,6 +5,40 @@ import numpy as np
 import logging
 
 
+def evaluation(
+    encoder, decoder, channel, bit_map,
+    batch_size,
+    n_batches,
+    hard_factor=1.0
+):
+    with torch.no_grad():
+        total_ber = 0.0
+        total_ser = 0.0
+        total_gmi = 0.0
+
+        for b_idx in range(n_batches):
+            symbols, idxs = encoder(batch_size) # Override the training batch size
+            rx = channel(symbols)
+            logits = hard_factor * decoder(rx)
+
+            symbol_probabilities = encoder.symbol_probabilities
+            term1 = torch.sum(bit_map[idxs] * logits.permute(0, 2, 1), dim=-1, keepdim=True).permute(0, 2, 1)
+            term2 = torch.matmul(bit_map, logits)
+            metric = term1 - term2
+                
+            gmi = -torch.mean(torch.logsumexp(
+                metric + torch.log(symbol_probabilities[None, :, None]), 
+                dim=1, 
+            )) / np.log(2)
+
+            decision_metric = term2
+            total_ber += torch.mean(((logits < 0) != bit_map[idxs, :].permute(0, 2, 1)).float())
+            total_ser += torch.mean((torch.argmin(decision_metric, dim=1) != idxs).float())
+            total_gmi += gmi
+
+        return total_ber.item() / n_batches, total_ser.item() / n_batches, total_gmi.item() / n_batches
+
+
 def pgcs_1(
         encoder, decoder, bit_map,
         encoder_grace,
@@ -13,6 +47,7 @@ def pgcs_1(
         proximal_lambda,
         n_epochs,
         bit_wise,
+        hard_factor=1.0,
         n_mean=50, n_logging=500, beta_mean=0.9
     ):
 
@@ -26,9 +61,9 @@ def pgcs_1(
     beta_2 = decoder_opt.param_groups[0]['betas'][1]
 
     # Main training loop
-    avg_ber = torch.tensor(0.0)
-    avg_ser = torch.tensor(0.0)
-    avg_gmi = torch.tensor(0.0)
+    avg_ber = 0.0
+    avg_ser = 0.0
+    avg_gmi = 0.0
     for e_idx in range(n_epochs):
         decoder_opt.zero_grad()
         encoder_opt.zero_grad()
@@ -40,7 +75,7 @@ def pgcs_1(
             symbols, idxs = encoder()
 
         rx = channel(symbols)
-        logits = decoder(rx)
+        logits = hard_factor * decoder(rx)
 
         symbol_probabilities = encoder.symbol_probabilities
         if bit_wise:
@@ -98,11 +133,12 @@ def pgcs_1(
                 avg_ber = beta_mean * avg_ber + (1 - beta_mean) * current_ber
                 avg_ser = beta_mean * avg_ser + (1 - beta_mean) * current_ser
                 avg_gmi = beta_mean * avg_gmi + (1 - beta_mean) * gmi_loss
-                if e_idx % n_logging == 0:
-                    logging.info(f"Epoch: {e_idx}")
-                    logging.info(f"SER estimate: {avg_ser.item()}")
-                    logging.info(f"BER estimate: {avg_ber.item()}")
-                    logging.info(f"GMI estimate: {avg_gmi.item()}")
+
+        if e_idx % n_logging == 0:
+            logging.info(f"Epoch: {e_idx}")
+            logging.info(f"SER estimate: {avg_ser.item()}")
+            logging.info(f"BER estimate: {avg_ber.item()}")
+            logging.info(f"GMI estimate: {avg_gmi.item()}")
 
     return avg_ber.item(), avg_ser.item(), avg_gmi.item()
 
@@ -130,10 +166,10 @@ def pgcs_2(
     beta_2 = decoder_opt.param_groups[0]['betas'][1]
 
     # Main training loop
-    avg_ber = torch.tensor(0.0)
-    avg_ser = torch.tensor(0.0)
-    avg_gmi = torch.tensor(0.0)
-    avg_gmi_bits = [torch.tensor(0.0) for _ in range(bit_map.shape[1])]
+    avg_ber = 0.0
+    avg_ser = 0.0
+    avg_gmi = 0.0
+    avg_gmi_bits = [0.0 for _ in range(bit_map.shape[1])]
     for e_idx in range(n_epochs):
         decoder_opt.zero_grad()
         encoder_opt.zero_grad()
